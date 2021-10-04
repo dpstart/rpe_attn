@@ -28,7 +28,7 @@ class RPE_NKA(nn.Module):
         dropout=0.0,
         qkv_bias=False,
         attn_out_bias=True,
-        max_len=1024,
+        max_len=2048,
     ):
         super().__init__()
         assert dim % heads == 0, "dimension must be divisible by number of heads"
@@ -52,9 +52,14 @@ class RPE_NKA(nn.Module):
         self.to_out = nn.Linear(inner_dim, dim, bias=attn_out_bias)
         self.dropout = nn.Dropout(dropout)
 
-    def forward(self, q, k, v, attn_mask, query_lengths, key_lengths):
 
-        b, n, _ = q.shape[:3]
+    def forward(self, q, k, v, attn_mask, query_lengths, key_lengths):
+        
+
+        q = rearrange(q, 'n l h e -> n h l e')
+        k = rearrange(k, 'n l h e -> n h l e')
+        v = rearrange(v, 'n l h e -> n h l e')
+        b, _, n = q.shape[:3]
 
         q, k = map(lambda t: t / torch.norm(t), (q, k))
         k_, q_ = map(lambda t: self.kernel_fn(t), (k, q))
@@ -67,8 +72,8 @@ class RPE_NKA(nn.Module):
         b = self.skew(QEr)
         c = torch.exp(b)
 
-        a_1 = torch.einsum("b h n x,b h n y->b h n x y", k_, v)
-        a_1 = rearrange(a_1, "b h n x y -> b h n (x y)")
+        a_1 = torch.einsum("b h n x,b h n y->b h x y", k_, v)
+        a_1 = rearrange(a_1, "b h x y -> b h (x y)")
 
         a_2 = k_
 
@@ -76,9 +81,9 @@ class RPE_NKA(nn.Module):
         d_1 = fft_multiply_parallel(c, a_1)
 
         d_1 = rearrange(
-            d_1, "b h n (x y) -> b h n x y", x=self.dim_heads, y=self.dim_heads
+            d_1, "b h (x y) -> b h x y", x=self.dim_heads, y=self.dim_heads
         )
-        top = torch.einsum("b h n x, b h n y z -> b h n z", q_, d_1)
+        top = torch.einsum("b h n x, b h y z -> b h n z", q_, d_1)
         bottom = torch.einsum("b h n x, b h n y -> b h n y", q_, d_2)
 
         out = top / bottom
@@ -98,27 +103,30 @@ class RPE_NKA(nn.Module):
 
 def fft_multiply_parallel(A, x):
 
+    return x
+
     b, h, n, d = x.shape
 
     # Select indices of first columns
     idx = [i for i in range(A.size(-1) - 1, -1, -1)]
-    idx = torch.LongTensor(idx)
+    idx = torch.LongTensor(idx).cuda()
     inverted_tensor_1 = A.index_select(-1, idx)
 
     # Select indices of first columns + x_0 at beginning
     idx = [0] + [i for i in range(A.size(-1) - 1, 0, -1)]
-    idx = torch.LongTensor(idx)
+    idx = torch.LongTensor(idx).cuda()
     inverted_tensor_2 = A.index_select(-2, idx)
     y = torch.cat(
         [inverted_tensor_1[:, :, :, 0], inverted_tensor_2[:, :, 0, :]], dim=-1
     )
 
-    zeros = torch.zeros(*x.shape[:-2], y.size(-1) - x.size(-2), x.shape[-1]).float()
+    zeros = torch.zeros(*x.shape[:-2], y.size(-1) - x.size(-2), x.shape[-1]).cuda()
     v = torch.cat((x, zeros), dim=-2)
-
-    h = torch.fft.fftn(y)[:, :, :, None] * torch.fft.fftn(v)
-    out = torch.fft.ifft(h)[:, :, : x.size(-2), :]
-    return out
+    h = v
+    #h = torch.fft.fftn(y)[:, :, :, None] * torch.fft.fftn(v)
+    #out = torch.fft.ifft(h)[:, :, : x.size(-2), :]
+    return h[:, :, : x.size(-2), :]
+    #return torch.real(out)
 
 
 AttentionRegistry.register(
@@ -126,7 +134,7 @@ AttentionRegistry.register(
     RPE_NKA,  # attention_type, class pair
     [
         ("dim", Int),
-        ("max_len", Optional(Int, 1024)),
+        ("max_len", Optional(Int, 2048)),
         ("heads", Optional(Int, 8)),
         ("dim_head", Optional(Int, 64)),
         ("nb_features", Optional(Int)),
@@ -134,18 +142,25 @@ AttentionRegistry.register(
 )
 
 # Create the builder for our transformers
-builder = TransformerEncoderBuilder.from_kwargs(dim=512, max_len=1024)
+builder = TransformerEncoderBuilder.from_kwargs(
+    n_layers=8,
+    n_heads=8,
+    query_dimensions=64,
+    value_dimensions=64,
+    feed_forward_dimensions=1024,
+    dim=8*64
+)
 
 # Build a transformer with softmax attention
 builder.attention_type = "full"
 softmax_model = builder.get()
 
 # Build a transformer with linear attention
-builder.attention_type = "linear"
+builder.attention_type = "rpe"
 linear_model = builder.get()
 
 # Construct the dummy input
-X = torch.rand(10, 1024, 8 * 64)
+X = torch.rand(10, 2048, 8*64)
 
 # Prepare everythin for CUDA
 X = X.cuda()
